@@ -15,32 +15,22 @@ MATCH_ID = "usa_iran"
 MATCH_HOME = "USA"
 MATCH_AWAY = "Iran"
 
-# saved predictions: chat_id -> (home_goals, away_goals)
 PREDICTIONS: dict[int, tuple[int, int]] = {}
-
-# pending step: chat_id -> selected_home_goals (waiting for away)
 PENDING_HOME: dict[int, int] = {}
 
-
-@app.get("/")
-async def health():
-    return {"status": "ok"}
-
-
-async def tg(method: str, payload: dict):
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post(f"{TELEGRAM_API}/{method}", json=payload)
-        data = r.json()
-        if not data.get("ok"):
-            raise RuntimeError(f"Telegram error: {data}")
-        return data
-
+# --- UI: Reply keyboard (big buttons) ---
+MAIN_MENU_KB = {
+    "keyboard": [
+        [{"text": "⚽ Predict"}, {"text": "🏆 Table"}],
+        [{"text": "ℹ️ Help"}],
+    ],
+    "resize_keyboard": True,
+    "one_time_keyboard": False,
+}
 
 def goals_keyboard(prefix: str) -> dict:
-    # buttons 0..5 in one row (simple)
     row = [{"text": str(g), "callback_data": f"{prefix}:{MATCH_ID}:{g}"} for g in range(0, 6)]
     return {"inline_keyboard": [row]}
-
 
 def predict_menu(chat_id: int) -> tuple[str, dict]:
     pred = PREDICTIONS.get(chat_id)
@@ -52,6 +42,17 @@ def predict_menu(chat_id: int) -> tuple[str, dict]:
         kb = {"inline_keyboard": [[{"text": "Set prediction", "callback_data": f"start:{MATCH_ID}"}]]}
     return text, kb
 
+async def tg(method: str, payload: dict):
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(f"{TELEGRAM_API}/{method}", json=payload)
+        data = r.json()
+        if not data.get("ok"):
+            raise RuntimeError(f"Telegram error: {data}")
+        return data
+
+@app.get("/")
+async def health():
+    return {"status": "ok", "version": "buttons-v1"}
 
 @app.post("/telegram/webhook")
 async def webhook(request: Request):
@@ -63,17 +64,54 @@ async def webhook(request: Request):
         chat_id = msg["chat"]["id"]
         text = (msg.get("text") or "").strip()
 
+        # normalize button texts to actions
+        if text == "⚽ Predict":
+            text = "/predict"
+        elif text == "🏆 Table":
+            text = "/table"
+        elif text == "ℹ️ Help":
+            text = "/help"
+
         if text.startswith("/start"):
-            await tg("sendMessage", {"chat_id": chat_id, "text": "Hello from Cloud Run 🚀\nTry /predict"})
+            await tg("sendMessage", {
+                "chat_id": chat_id,
+                "text": "Welcome! Use the buttons below 👇",
+                "reply_markup": MAIN_MENU_KB
+            })
+
         elif text.startswith("/predict"):
             text_out, kb = predict_menu(chat_id)
-            await tg("sendMessage", {"chat_id": chat_id, "text": text_out, "reply_markup": kb})
+            await tg("sendMessage", {
+                "chat_id": chat_id,
+                "text": text_out,
+                "reply_markup": kb
+            })
+
+        elif text.startswith("/table"):
+            # placeholder for later
+            await tg("sendMessage", {
+                "chat_id": chat_id,
+                "text": "🏆 Table is not implemented yet (next step).",
+                "reply_markup": MAIN_MENU_KB
+            })
+
+        elif text.startswith("/help"):
+            await tg("sendMessage", {
+                "chat_id": chat_id,
+                "text": "Buttons:\n⚽ Predict — set your score\n🏆 Table — leaderboard (coming next)",
+                "reply_markup": MAIN_MENU_KB
+            })
+
         else:
-            await tg("sendMessage", {"chat_id": chat_id, "text": "Commands: /predict"})
+            await tg("sendMessage", {
+                "chat_id": chat_id,
+                "text": "Use the buttons below 👇",
+                "reply_markup": MAIN_MENU_KB
+            })
 
         return {"ok": True}
 
-    # --- handle button clicks (callback_query) ---
+    # --- handle button clicks (inline callback_query) ---
     cq = update.get("callback_query")
     if cq:
         cq_id = cq["id"]
@@ -81,40 +119,33 @@ async def webhook(request: Request):
         chat_id = cq["message"]["chat"]["id"]
         message_id = cq["message"]["message_id"]
 
-        # always acknowledge click so Telegram UI stops "loading"
         await tg("answerCallbackQuery", {"callback_query_id": cq_id})
 
-        # start prediction flow
         if data.startswith("start:"):
-            text_out = f"Select {MATCH_HOME} goals:"
             await tg("editMessageText", {
                 "chat_id": chat_id,
                 "message_id": message_id,
-                "text": text_out,
+                "text": f"Select {MATCH_HOME} goals:",
                 "reply_markup": goals_keyboard("home")
             })
             return {"ok": True}
 
-        # home goals selected
         if data.startswith("home:"):
             _, match_id, goals = data.split(":")
             if match_id == MATCH_ID:
                 PENDING_HOME[chat_id] = int(goals)
-                text_out = f"Selected: {MATCH_HOME} {goals} - ? {MATCH_AWAY}\n\nSelect {MATCH_AWAY} goals:"
                 await tg("editMessageText", {
                     "chat_id": chat_id,
                     "message_id": message_id,
-                    "text": text_out,
+                    "text": f"Selected: {MATCH_HOME} {goals} - ? {MATCH_AWAY}\n\nSelect {MATCH_AWAY} goals:",
                     "reply_markup": goals_keyboard("away")
                 })
             return {"ok": True}
 
-        # away goals selected -> save prediction
         if data.startswith("away:"):
             _, match_id, goals = data.split(":")
             if match_id == MATCH_ID:
                 if chat_id not in PENDING_HOME:
-                    # if user somehow skipped home step, restart
                     await tg("editMessageText", {
                         "chat_id": chat_id,
                         "message_id": message_id,
@@ -125,7 +156,6 @@ async def webhook(request: Request):
 
                 home_goals = PENDING_HOME.pop(chat_id)
                 away_goals = int(goals)
-
                 PREDICTIONS[chat_id] = (home_goals, away_goals)
 
                 text_out, kb = predict_menu(chat_id)
